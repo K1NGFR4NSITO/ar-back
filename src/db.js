@@ -10,8 +10,9 @@ let pool;
 if (process.env.DATABASE_URL) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
   });
+  console.log("✅ Conectando a PostgreSQL remoto (Render)...");
 } else {
   // Modo local con variables separadas (tu .env actual)
   pool = new Pool({
@@ -21,6 +22,7 @@ if (process.env.DATABASE_URL) {
     user: process.env.PGUSER || "postgres",
     password: process.env.PGPASSWORD || "",
   });
+  console.log("🧩 Conectando a PostgreSQL local...");
 }
 
 export { pool };
