@@ -85,20 +85,26 @@ io.on("connection", (socket) => {
 // Acepta UPGRADE solo en /ws (evita que Render/health check rompa el WS)
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
+// ✅ intercepta SOLO /ws y deja pasar /socket.io (Socket.IO) u otros upgrades
 server.on("upgrade", (req, socket, head) => {
+  let pathname = "";
   try {
-    const { pathname } = new URL(req.url, `http://${req.headers.host}`);
-    if (pathname !== "/ws") {
-      socket.destroy(); // cualquier cosa que no sea /ws se rechaza
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
+    pathname = new URL(req.url, `http://${req.headers.host}`).pathname || "";
   } catch {
-    socket.destroy();
+    // si no podemos parsear la URL, dejamos que otros listeners la manejen
+    return;
   }
+
+  if (pathname !== "/ws") {
+    // No es nuestro WS puro; que lo maneje Socket.IO u otro listener
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
 });
+
 
 // Heartbeat para no cortar conexiones inactivas
 function startHeartbeat(ws) {
