@@ -1,18 +1,17 @@
 {
   "name": "ar-backend",
   "version": "1.0.0",
-  "private": true,
-  "main": "src/server.js",
+  "type": "module",
   "scripts": {
     "start": "node src/server.js"
   },
-  "engines": {
-    "node": "20.x"
-  },
   "dependencies": {
-    "cors": "^2.8.5",
     "express": "^4.19.2",
+    "cors": "^2.8.5",
     "pg": "^8.11.5",
-    "socket.io": "^4.7.5"
+    "ws": "^8.17.1",
+    "socket.io": "^4.7.5",
+    "zod": "^3.23.8",
+    "dotenv": "^16.4.5"
   }
 }
