@@ -1,142 +1,133 @@
 // src/server.js
-import express from "express";
-import cors from "cors";
-import "dotenv/config";
-import http from "http";
-import { Server as SocketIOServer } from "socket.io";
-import { WebSocketServer } from "ws";           // ← WS puro
-import { z } from "zod";
-import { pool } from "./db.js";
+// Backend AR Química — Express + Socket.IO + PostgreSQL (Render-ready)
 
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const { Pool } = require("pg");
+
+// ====== Config ======
+const PORT = process.env.PORT || 10000;
 const app = express();
-app.use(cors({ origin: "*" }));                 // en prod: limita tu dominio
-app.use(express.json());
-
-// ---------------- REST (pruebas / fallback) ----------------
-app.post("/scores", async (req, res) => {
-  try {
-    const schema = z.object({
-      name: z.string().min(1).max(60),
-      score: z.number().int().nonnegative(),
-    });
-    const data = schema.parse(req.body);
-
-    const { rows } = await pool.query(
-      "insert into scores(name, score) values ($1,$2) returning id, name, score, created_at",
-      [data.name, data.score]
-    );
-
-    broadcastTop().catch(console.error);
-    res.json({ ok: true, score: rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ ok: false, error: String(err) });
-  }
-});
-
-app.get("/scores/top", async (req, res) => {
-  const n = Math.min(parseInt(req.query.n ?? "10", 10) || 10, 50);
-  const { rows } = await pool.query(
-    "select id, name, score, created_at from scores order by score desc, id asc limit $1",
-    [n]
-  );
-  res.json(rows);
-});
-
-// ---------------- HTTP base ----------------
-const HOST = process.env.HOST || "0.0.0.0";
-const PORT = Number(process.env.PORT || 3000);
 const server = http.createServer(app);
 
-// ---------------- Socket.IO (para web) ----------------
-const io = new SocketIOServer(server, { cors: { origin: "*" } }); // prod: restringe
-
-const SubmitSchema = z.object({
-  name: z.string().min(1).max(60),
-  score: z.number().int().nonnegative(),
+// CORS: permite tu web (puedes agregar más orígenes si los necesitas)
+const io = require("socket.io")(server, {
+  cors: {
+    origin: ["*"], // si quieres cerrarlo: ["https://TU-SITIO.netlify.app", "http://localhost:5500"]
+    methods: ["GET", "POST"],
+  },
 });
 
-io.on("connection", (socket) => {
-  console.log("✅ socket conectado:", socket.id);
+app.use(cors({ origin: "*"}));
+app.use(express.json());
 
-  socket.on("get_top", async (n = 10) => {
-    const top = await getTop(n);
-    socket.emit("top", top);
-  });
-
-  socket.on("submit_score", async (payload, cb) => {
-    try {
-      const data = SubmitSchema.parse(payload);
-      const { rows } = await pool.query(
-        "insert into scores(name, score) values ($1,$2) returning id, name, score, created_at",
-        [data.name, data.score]
-      );
-      cb?.({ ok: true, score: rows[0] });
-      await broadcastTop();
-    } catch (err) {
-      console.error("submit_score error:", err);
-      cb?.({ ok: false, error: String(err) });
-    }
-  });
-
-  socket.on("disconnect", (reason) => {
-    console.log("❌ socket desconectado:", socket.id, reason);
-  });
+// ====== PostgreSQL ======
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // En Render Postgres se requiere SSL
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
-// ---------------- WebSocket puro (para Unity) ----------------
-const wss = new WebSocketServer({ server });    // comparte el mismo puerto 3000
+// Crea tabla si no existe
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS scores (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      score INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS scores_score_idx ON scores(score DESC);
+    CREATE INDEX IF NOT EXISTS scores_created_idx ON scores(created_at DESC);
+  `);
+}
 
-wss.on("connection", (ws, req) => {
-  console.log("✅ WS puro conectado:", req.socket.remoteAddress);
-
-  ws.on("message", async (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      // Espera: { type:"score", name:"Ernesto", score:123 }
-      if (msg?.type === "score" && typeof msg.name === "string" && Number.isInteger(msg.score)) {
-        const { rows } = await pool.query(
-          "insert into scores(name, score) values ($1,$2) returning id, name, score, created_at",
-          [msg.name, msg.score]
-        );
-        ws.send(JSON.stringify({ ok: true, score: rows[0] }));
-        broadcastTop().catch(console.error);
-      } else if (msg?.type === "get_top") {
-        const top = await getTop(10);
-        ws.send(JSON.stringify({ type: "top", data: top }));
-      } else {
-        ws.send(JSON.stringify({ ok: false, error: "payload inválido" }));
-      }
-    } catch (e) {
-      console.error("WS msg error:", e);
-      ws.send(JSON.stringify({ ok: false, error: String(e) }));
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("❌ WS puro desconectado");
-  });
-
-  ws.send(JSON.stringify({ type: "hello", msg: "conectado" }));
-});
-
-// ---------------- Utils compartidas ----------------
-async function getTop(n = 10) {
-  n = Math.min(parseInt(n, 10) || 10, 50);
+// Helper para traer TOP N
+async function getTop(n = 20) {
+  const lim = Math.max(1, Math.min(Number(n) || 20, 500));
   const { rows } = await pool.query(
-    "select id, name, score, created_at from scores order by score desc, id asc limit $1",
-    [n]
+    `SELECT id, name, score, created_at
+     FROM scores
+     ORDER BY score DESC, name ASC
+     LIMIT $1`,
+    [lim]
   );
   return rows;
 }
 
-async function broadcastTop() {
-  const top = await getTop(10);
-  io.emit("top_updated", top); // web por Socket.IO
-  // opcional: también podrías iterar los clientes WS puros y enviarles
-  // for (const client of wss.clients) if (client.readyState === 1) client.send(JSON.stringify({ type:"top_updated", data: top }));
-}
-
-server.listen(PORT, HOST, () => {
-  console.log(`Servidor escuchando en http://${HOST}:${PORT}`);
+// ====== Rutas HTTP ======
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "ar-back", version: 1 });
 });
+
+app.get("/health", (_req, res) => res.send("ok"));
+
+app.get("/scores/top", async (req, res) => {
+  try {
+    const n = req.query.n || 20;
+    const rows = await getTop(n);
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /scores/top error:", err);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+app.post("/scores", async (req, res) => {
+  try {
+    let { name, score } = req.body || {};
+    name = String(name || "").trim().slice(0, 80);
+    score = Number(score) || 0;
+
+    if (!name) return res.status(400).json({ error: "name_required" });
+    if (!Number.isFinite(score)) return res.status(400).json({ error: "invalid_score" });
+
+    await pool.query(
+      "INSERT INTO scores (name, score) VALUES ($1, $2)",
+      [name, score]
+    );
+
+    // Notifica a todos los sockets que hay nuevo TOP
+    const top = await getTop(20);
+    io.emit("top_updated", top);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /scores error:", err);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+// ====== Socket.IO (tiempo real) ======
+io.on("connection", (socket) => {
+  console.log("🔌 Socket conectado:", socket.id);
+
+  // Cliente pide el top inicial
+  socket.on("get_top", async (n) => {
+    try {
+      const top = await getTop(n || 20);
+      socket.emit("top", top);
+    } catch (e) {
+      console.error("socket get_top error:", e);
+    }
+  });
+
+  socket.on("disconnect", (reason) => {
+    console.log("🔌 Socket desconectado:", socket.id, reason);
+  });
+});
+
+// ====== Start ======
+(async () => {
+  try {
+    console.log("✅ Conectando a PostgreSQL remoto (Render)...");
+    await ensureSchema();
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`Servidor escuchando en http://0.0.0.0:${PORT}`);
+    });
+  } catch (e) {
+    console.error("❌ Error al iniciar servidor:", e);
+    process.exit(1);
+  }
+})();
