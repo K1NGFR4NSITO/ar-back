@@ -1,144 +1,169 @@
 // src/server.js
-"use strict";
-
-/**
- * Backend AR Química - versión estable para Render
- * -------------------------------------------------
- * • Express + Socket.IO (live ranking)
- * • PostgreSQL remoto con SSL
- * • Compatible con JSON, x-www-form-urlencoded y text/plain
- * • Endpoints:
- *    GET  /scores/top?n=20
- *    POST /scores { name, score }
- */
-
-const express = require("express");
-const http = require("http");
-const cors = require("cors");
-const { Pool } = require("pg");
-const { Server } = require("socket.io");
-
-// ------------------------
-// Configuración base
-// ------------------------
-const PORT = process.env.PORT || 10000;
-const DATABASE_URL = process.env.DATABASE_URL;
-
-if (!DATABASE_URL) {
-  console.warn("⚠️  DATABASE_URL no está definido. Probablemente estás en local.");
-}
-
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+import express from "express";
+import cors from "cors";
+import "dotenv/config";
+import http from "http";
+import { Server as SocketIOServer } from "socket.io";
+import { WebSocketServer } from "ws";
+import { z } from "zod";
+import { pool } from "./db.js";
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+app.use(cors({ origin: "*" }));          // en prod: restringe a tu dominio/front
+app.use(express.json());
+
+// --- Health check (Render) ---
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+// --- REST (fallback / pruebas) ---
+const SubmitSchema = z.object({
+  name: z.string().min(1).max(60),
+  score: z.number().int().nonnegative(),
 });
 
-// ------------------------
-// Middlewares
-// ------------------------
-app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
-
-// Permitir text/plain con JSON adentro (algunas SDK móviles)
-app.use((req, _res, next) => {
-  if (req.is("text/plain") && typeof req.body === "string") {
-    try { req.body = JSON.parse(req.body); } catch { /* ignora si no es JSON */ }
+app.post("/scores", async (req, res) => {
+  try {
+    const data = SubmitSchema.parse(req.body);
+    const { rows } = await pool.query(
+      "insert into scores(name, score) values ($1,$2) returning id, name, score, created_at",
+      [data.name, data.score]
+    );
+    await broadcastTop();
+    res.json({ ok: true, score: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ ok: false, error: String(err) });
   }
-  next();
 });
 
-// ------------------------
-// Helpers
-// ------------------------
-async function getTop(n = 20) {
-  const limit = Math.max(1, Math.min(Number(n) || 20, 500));
+app.get("/scores/top", async (req, res) => {
+  // cap de seguridad
+  const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
   const { rows } = await pool.query(
-    `SELECT id, name, score, created_at
-       FROM scores
-      ORDER BY score DESC, id ASC
-      LIMIT $1`,
-    [limit]
+    "select id, name, score, created_at from scores order by score desc, id asc limit $1",
+    [n]
+  );
+  res.json(rows);
+});
+
+// --- HTTP base ---
+const HOST = process.env.HOST || "0.0.0.0";
+const PORT = Number(process.env.PORT || 3000);
+const server = http.createServer(app);
+
+// --- Socket.IO (para web) ---
+const io = new SocketIOServer(server, { cors: { origin: "*" } }); // prod: restringe
+
+io.on("connection", (socket) => {
+  console.log("✅ socket conectado:", socket.id);
+
+  socket.on("get_top", async (n = 10) => {
+    const top = await getTop(n);
+    socket.emit("top", top);
+  });
+
+  socket.on("submit_score", async (payload, cb) => {
+    try {
+      const data = SubmitSchema.parse(payload);
+      const { rows } = await pool.query(
+        "insert into scores(name, score) values ($1,$2) returning id, name, score, created_at",
+        [data.name, data.score]
+      );
+      cb?.({ ok: true, score: rows[0] });
+      await broadcastTop();
+    } catch (err) {
+      console.error("submit_score error:", err);
+      cb?.({ ok: false, error: String(err) });
+    }
+  });
+
+  socket.on("disconnect", (reason) => {
+    console.log("❌ socket desconectado:", socket.id, reason);
+  });
+});
+
+// --- WebSocket puro (Unity) ---
+// Comparte puerto con HTTP/Socket.IO • sin path especial (Unity puede conectarse a wss://…)
+const wss = new WebSocketServer({
+  server,
+  // algunos proxies se llevan mal con perMessageDeflate
+  perMessageDeflate: false,
+});
+
+// Heartbeat para que Render/proxy no corte la conexión inactiva
+function startHeartbeat(ws) {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+}
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, 30000);
+
+wss.on("connection", (ws, req) => {
+  console.log("✅ WS puro conectado:", req.socket.remoteAddress);
+  startHeartbeat(ws);
+
+  ws.on("message", async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg?.type === "score") {
+        const data = SubmitSchema.parse({ name: msg.name, score: msg.score });
+        const { rows } = await pool.query(
+          "insert into scores(name, score) values ($1,$2) returning id, name, score, created_at",
+          [data.name, data.score]
+        );
+        ws.send(JSON.stringify({ ok: true, score: rows[0] }));
+        await broadcastTop();
+      } else if (msg?.type === "get_top") {
+        const top = await getTop(msg.n ?? 10);
+        ws.send(JSON.stringify({ type: "top", data: top }));
+      } else {
+        ws.send(JSON.stringify({ ok: false, error: "payload inválido" }));
+      }
+    } catch (e) {
+      console.error("WS msg error:", e);
+      try { ws.send(JSON.stringify({ ok: false, error: String(e) })); } catch {}
+    }
+  });
+
+  ws.on("close", () => console.log("❌ WS puro desconectado"));
+  ws.on("error", (e) => console.warn("WS error:", e?.message || e));
+
+  try { ws.send(JSON.stringify({ type: "hello", msg: "conectado" })); } catch {}
+});
+
+// --- Utils compartidas ---
+async function getTop(n = 10) {
+  n = Math.min(Math.max(parseInt(n, 10) || 10, 1), 200);
+  const { rows } = await pool.query(
+    "select id, name, score, created_at from scores order by score desc, id asc limit $1",
+    [n]
   );
   return rows;
 }
 
-// ------------------------
-// Rutas HTTP
-// ------------------------
-
-// Health check y raíz
-app.get("/", (_req, res) =>
-  res.json({ ok: true, service: "ar-back", now: new Date().toISOString() })
-);
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
-
-// Obtener top N
-app.get("/scores/top", async (req, res) => {
-  try {
-    const n = Math.max(1, Math.min(parseInt(req.query.n || "20", 10) || 20, 500));
-    const rows = await getTop(n);
-    res.json(rows);
-  } catch (err) {
-    console.error("GET /scores/top error:", err);
-    res.status(500).json({ error: "internal_error" });
-  }
-});
-
-// Registrar nuevo puntaje
-app.post("/scores", async (req, res) => {
-  try {
-    console.log("📩 POST /scores body:", req.body);
-
-    let { name, score } = req.body || {};
-    name = String(name || "").trim().slice(0, 80);
-    score = Number(score);
-
-    if (!name) return res.status(400).json({ error: "name_required" });
-    if (!Number.isFinite(score)) return res.status(400).json({ error: "invalid_score" });
-
-    await pool.query("INSERT INTO scores (name, score) VALUES ($1, $2)", [name, score]);
-
-    const top20 = await getTop(20);
-    io.emit("top_updated", top20);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("POST /scores error:", err);
-    res.status(500).json({ error: "internal_error" });
-  }
-});
-
-// ------------------------
-// Socket.IO (live updates)
-// ------------------------
-io.on("connection", (socket) => {
-  console.log("🔌 Socket conectado:", socket.id);
-
-  socket.on("disconnect", (reason) => {
-    console.log("🔌 Socket desconectado:", socket.id, reason);
-  });
-
-  socket.on("get_top", async (n) => {
-    try {
-      const rows = await getTop(n || 20);
-      socket.emit("top", rows);
-    } catch (err) {
-      console.error("get_top error:", err);
-      socket.emit("top", []);
+async function broadcastTop() {
+  const top = await getTop(10);
+  // Web (Socket.IO)
+  io.emit("top_updated", top);
+  // WS puro (Unity)
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      try { client.send(JSON.stringify({ type: "top_updated", data: top })); } catch {}
     }
-  });
+  }
+}
+
+// --- Arranque / cierre ---
+server.listen(PORT, HOST, () => {
+  console.log(`Servidor escuchando en http://${HOST}:${PORT}`);
 });
 
-// ------------------------
-// Inicio del servidor
-// ------------------------
-server.listen(PORT, () => {
-  console.log(`✅ Servidor escuchando en http://0.0.0.0:${PORT}`);
+process.on("SIGTERM", () => {
+  clearInterval(pingInterval);
+  server.close(() => process.exit(0));
 });
