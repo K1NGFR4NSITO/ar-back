@@ -2,41 +2,35 @@
 "use strict";
 
 /**
- * Backend AR Química - Render
- * - Express + Socket.IO
- * - PostgreSQL (Render managed) con SSL
- * - Endpoints:
+ * Backend AR Química - versión estable para Render
+ * -------------------------------------------------
+ * • Express + Socket.IO (live ranking)
+ * • PostgreSQL remoto con SSL
+ * • Compatible con JSON, x-www-form-urlencoded y text/plain
+ * • Endpoints:
  *    GET  /scores/top?n=20
- *    POST /scores {name, score}
- * - Emite eventos Socket.IO:
- *    "top" (respuesta a "get_top")
- *    "top_updated" (cuando se inserta un score nuevo)
- *
- * Notas:
- *  - Acepta JSON y también x-www-form-urlencoded y text/plain (por si la app móvil no manda JSON estricto).
- *  - Se retiró el WS "puro" con 'ws' (causaba invalid close code en Render). Nos quedamos con Socket.IO.
+ *    POST /scores { name, score }
  */
 
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
-const morgan = require("morgan");
 const { Pool } = require("pg");
 const { Server } = require("socket.io");
 
 // ------------------------
-// Config / Setup
+// Configuración base
 // ------------------------
 const PORT = process.env.PORT || 10000;
-const DATABASE_URL = process.env.DATABASE_URL; // Render la inyecta
+const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DATABASE_URL) {
-  console.warn("⚠️  DATABASE_URL no está definido. ¿Estás corriendo en local?");
+  console.warn("⚠️  DATABASE_URL no está definido. Probablemente estás en local.");
 }
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Requerido por Render PG
+  ssl: { rejectUnauthorized: false },
 });
 
 const app = express();
@@ -45,13 +39,14 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
+// ------------------------
 // Middlewares
-app.use(cors({ origin: "*"}));
-app.use(morgan("tiny"));
+// ------------------------
+app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Si llega text/plain con JSON dentro (algunas SDKs móviles)
+// Permitir text/plain con JSON adentro (algunas SDK móviles)
 app.use((req, _res, next) => {
   if (req.is("text/plain") && typeof req.body === "string") {
     try { req.body = JSON.parse(req.body); } catch { /* ignora si no es JSON */ }
@@ -74,16 +69,17 @@ async function getTop(n = 20) {
   return rows;
 }
 
-// Pequeño “wake” para Render (y health)
-app.get("/", (_req, res) => res.json({ ok: true, service: "ar-back", now: new Date().toISOString() }));
+// ------------------------
+// Rutas HTTP
+// ------------------------
+
+// Health check y raíz
+app.get("/", (_req, res) =>
+  res.json({ ok: true, service: "ar-back", now: new Date().toISOString() })
+);
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
-app.get("/wake", (_req, res) => res.json({ ok: true, woke: new Date().toISOString() }));
 
-// ------------------------
-// API
-// ------------------------
-
-// TOP N
+// Obtener top N
 app.get("/scores/top", async (req, res) => {
   try {
     const n = Math.max(1, Math.min(parseInt(req.query.n || "20", 10) || 20, 500));
@@ -95,11 +91,10 @@ app.get("/scores/top", async (req, res) => {
   }
 });
 
-// INSERT SCORE (JSON o form-encoded)
+// Registrar nuevo puntaje
 app.post("/scores", async (req, res) => {
   try {
-    // Log diagnóstico mínimo (no sensitivo)
-    console.log("POST /scores body:", req.body);
+    console.log("📩 POST /scores body:", req.body);
 
     let { name, score } = req.body || {};
     name = String(name || "").trim().slice(0, 80);
@@ -108,12 +103,8 @@ app.post("/scores", async (req, res) => {
     if (!name) return res.status(400).json({ error: "name_required" });
     if (!Number.isFinite(score)) return res.status(400).json({ error: "invalid_score" });
 
-    await pool.query(
-      "INSERT INTO scores (name, score) VALUES ($1, $2)",
-      [name, score]
-    );
+    await pool.query("INSERT INTO scores (name, score) VALUES ($1, $2)", [name, score]);
 
-    // Actualiza a los clientes en vivo
     const top20 = await getTop(20);
     io.emit("top_updated", top20);
 
@@ -125,13 +116,13 @@ app.post("/scores", async (req, res) => {
 });
 
 // ------------------------
-// Socket.IO (live ranking)
+// Socket.IO (live updates)
 // ------------------------
 io.on("connection", (socket) => {
-  console.log("🔌 socket conectado:", socket.id);
+  console.log("🔌 Socket conectado:", socket.id);
 
   socket.on("disconnect", (reason) => {
-    console.log("🔌 socket desconectado:", socket.id, reason);
+    console.log("🔌 Socket desconectado:", socket.id, reason);
   });
 
   socket.on("get_top", async (n) => {
@@ -146,23 +137,8 @@ io.on("connection", (socket) => {
 });
 
 // ------------------------
-// WS "puro" con 'ws' (DESACTIVADO EN RENDER)
-// ------------------------
-/**
- * ATENCIÓN:
- * Los errores de:
- *  - WS_ERR_INVALID_CLOSE_CODE
- *  - RangeError: Invalid WebSocket frame: invalid status code XXXXX
- * venían del servidor WS crudo (paquete 'ws') corriendo en Render.
- * Para evitar los cierres / proxys intermedios, nos quedamos con Socket.IO.
- *
- * Si quieres usar WS puro sólo en local, podrías activarlo
- * condicionando por NODE_ENV === 'development'.
- */
-
-// ------------------------
-// Start
+// Inicio del servidor
 // ------------------------
 server.listen(PORT, () => {
-  console.log(`Servidor escuchando en http://0.0.0.0:${PORT}`);
+  console.log(`✅ Servidor escuchando en http://0.0.0.0:${PORT}`);
 });
