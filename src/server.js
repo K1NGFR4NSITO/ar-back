@@ -9,7 +9,7 @@ import { z } from "zod";
 import { pool } from "./db.js";
 
 const app = express();
-app.use(cors({ origin: "*" }));          // en prod: restringe a tu dominio/front
+app.use(cors({ origin: "*" })); // en prod: restringe a tu dominio/front
 app.use(express.json());
 
 // --- Health check (Render) ---
@@ -37,7 +37,6 @@ app.post("/scores", async (req, res) => {
 });
 
 app.get("/scores/top", async (req, res) => {
-  // cap de seguridad
   const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
   const { rows } = await pool.query(
     "select id, name, score, created_at from scores order by score desc, id asc limit $1",
@@ -83,14 +82,25 @@ io.on("connection", (socket) => {
 });
 
 // --- WebSocket puro (Unity) ---
-// Comparte puerto con HTTP/Socket.IO • sin path especial (Unity puede conectarse a wss://…)
-const wss = new WebSocketServer({
-  server,
-  // algunos proxies se llevan mal con perMessageDeflate
-  perMessageDeflate: false,
+// Acepta UPGRADE solo en /ws (evita que Render/health check rompa el WS)
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+    if (pathname !== "/ws") {
+      socket.destroy(); // cualquier cosa que no sea /ws se rechaza
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } catch {
+    socket.destroy();
+  }
 });
 
-// Heartbeat para que Render/proxy no corte la conexión inactiva
+// Heartbeat para no cortar conexiones inactivas
 function startHeartbeat(ws) {
   ws.isAlive = true;
   ws.on("pong", () => { ws.isAlive = true; });
@@ -107,9 +117,12 @@ wss.on("connection", (ws, req) => {
   console.log("✅ WS puro conectado:", req.socket.remoteAddress);
   startHeartbeat(ws);
 
+  ws.on("error", (e) => console.warn("WS client error:", e?.message || e));
+
   ws.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+
       if (msg?.type === "score") {
         const data = SubmitSchema.parse({ name: msg.name, score: msg.score });
         const { rows } = await pool.query(
@@ -118,9 +131,11 @@ wss.on("connection", (ws, req) => {
         );
         ws.send(JSON.stringify({ ok: true, score: rows[0] }));
         await broadcastTop();
+
       } else if (msg?.type === "get_top") {
         const top = await getTop(msg.n ?? 10);
         ws.send(JSON.stringify({ type: "top", data: top }));
+
       } else {
         ws.send(JSON.stringify({ ok: false, error: "payload inválido" }));
       }
@@ -131,7 +146,6 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => console.log("❌ WS puro desconectado"));
-  ws.on("error", (e) => console.warn("WS error:", e?.message || e));
 
   try { ws.send(JSON.stringify({ type: "hello", msg: "conectado" })); } catch {}
 });
@@ -161,9 +175,4 @@ async function broadcastTop() {
 // --- Arranque / cierre ---
 server.listen(PORT, HOST, () => {
   console.log(`Servidor escuchando en http://${HOST}:${PORT}`);
-});
-
-process.on("SIGTERM", () => {
-  clearInterval(pingInterval);
-  server.close(() => process.exit(0));
 });
