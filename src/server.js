@@ -46,6 +46,7 @@ app.get("/scores/top", async (req, res) => {
   res.json(rows);
 });
 
+// === CHALLENGES ===
 const ChallengeSchema = z.object({
   name: z.string().min(1).max(80),
   points_per_combo: z.number().int().min(0),
@@ -54,15 +55,17 @@ const ChallengeSchema = z.object({
   fusion_ids: z.array(z.string().min(1)).min(1).max(500),
 });
 
-// Seguridad mínima para publicar desde tu panel web
+// Seguridad mínima (podrás activarla cuando quieras)
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
 
-// Crea desafío (usa tu panel Netlify)
+// Crea desafío
 app.post("/challenges", async (req, res) => {
   try {
+    // Si aun no quieres seguridad, deja esta línea comentada:
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
+
     const body = ChallengeSchema.parse(req.body);
 
     const { rows } = await pool.query(
@@ -71,59 +74,38 @@ app.post("/challenges", async (req, res) => {
        RETURNING id, name, points_per_combo, required_count, expires_at, created_at`,
       [body.name, body.points_per_combo, body.required_count, body.duration_minutes]
     );
+
     const challengeId = rows[0].id;
 
-    const values = body.fusion_ids.map((fid) => `(${challengeId}, '${fid}')`).join(",");
+    // Inserta fusion_ids
+    const values = body.fusion_ids.map((fid, i) => `($1, $${i + 2})`).join(",");
     await pool.query(
-      `INSERT INTO challenge_fusions (challenge_id, fusion_id) VALUES ${values}`
+      `INSERT INTO challenge_fusions (challenge_id, fusion_id) VALUES ${values}`,
+      [challengeId, ...body.fusion_ids]
     );
 
-    // notifica a web y Unity
+    // Notifica
     await broadcastChallengeUpdate(challengeId);
 
     res.json({ ok: true, challenge: rows[0] });
   } catch (e) {
-    console.error(e);
+    console.error("POST /challenges", e);
     res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
-// Obtiene el desafío activo (el que expira primero y sigue vigente)
+// Desafío activo
 app.get("/challenges/active", async (_req, res) => {
-  const c = await pool.query(
-    `SELECT id, name, points_per_combo, required_count, expires_at
-       FROM challenges
-      WHERE expires_at > NOW()
-      ORDER BY expires_at ASC
-      LIMIT 1`
-  );
-  if (c.rowCount === 0) return res.json(null);
-
-  const f = await pool.query(
-    `SELECT fusion_id FROM challenge_fusions WHERE challenge_id = $1`,
-    [c.rows[0].id]
-  );
-  res.json({ ...c.rows[0], fusion_ids: f.rows.map((r) => r.fusion_id) });
-});
-
-// Borrar desafío (por id)
-app.delete("/challenges/:id", async (req, res) => {
   try {
-    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-    await pool.query("DELETE FROM challenges WHERE id = $1", [req.params.id]);
-    await broadcastChallengeUpdate(null);
-    res.json({ ok: true });
+    const payload = await getActiveChallengePayload();
+    res.json(payload);
   } catch (e) {
-    console.error(e);
+    console.error("GET /challenges/active", e);
     res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
-// --- Listado/Historial de desafíos ---
-
-// GET /challenges/history?n=10  (alias simple)
+// Historial simple (poner ANTES de /:id)
 app.get("/challenges/history", async (req, res) => {
   try {
     const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
@@ -145,12 +127,12 @@ app.get("/challenges/history", async (req, res) => {
     );
     res.json(rows);
   } catch (e) {
-    console.error(e);
+    console.error("GET /challenges/history", e);
     res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
-// GET /challenges?limit=20&offset=0  (paginado más flexible)
+// Listado paginado (poner ANTES de /:id)
 app.get("/challenges", async (req, res) => {
   try {
     const limit  = Math.min(Math.max(parseInt(req.query.limit ?? "20", 10) || 20, 1), 200);
@@ -173,15 +155,19 @@ app.get("/challenges", async (req, res) => {
     );
     res.json(rows);
   } catch (e) {
-    console.error(e);
+    console.error("GET /challenges", e);
     res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
-// GET /challenges/:id  (detalle por id)
+// Detalle por id (poner DESPUÉS de las rutas anteriores)
 app.get("/challenges/:id", async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_id" });
+    }
+
     const c = await pool.query(
       `SELECT id, name, points_per_combo, required_count, expires_at, created_at
          FROM challenges
@@ -196,19 +182,36 @@ app.get("/challenges/:id", async (req, res) => {
     );
     res.json({ ...c.rows[0], fusion_ids: f.rows.map(r => r.fusion_id) });
   } catch (e) {
-    console.error(e);
+    console.error("GET /challenges/:id", e);
     res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
+// Borrar desafío
+app.delete("/challenges/:id", async (req, res) => {
+  try {
+    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_id" });
+    }
+    await pool.query("DELETE FROM challenges WHERE id = $1", [id]);
+    await broadcastChallengeUpdate(null);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /challenges/:id", e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
 
-// Utilidad de broadcast (web y Unity)
-async function broadcastChallengeUpdate(idOrNull) {
-  // Web (Socket.IO)
+// --- helpers de broadcast ---
+async function broadcastChallengeUpdate() {
   const payload = await getActiveChallengePayload();
+  // web (Socket.IO)
   io.emit("challenge_updated", payload);
-
-  // WS puro (Unity)
+  // unity (WS)
   for (const client of wss.clients) {
     if (client.readyState === 1) {
       try { client.send(JSON.stringify({ type: "challenge_updated", data: payload })); } catch {}
@@ -225,12 +228,14 @@ async function getActiveChallengePayload() {
       LIMIT 1`
   );
   if (c.rowCount === 0) return null;
+
   const f = await pool.query(
     `SELECT fusion_id FROM challenge_fusions WHERE challenge_id = $1`,
     [c.rows[0].id]
   );
   return { ...c.rows[0], fusion_ids: f.rows.map((r) => r.fusion_id) };
 }
+
 
 // --- HTTP base ---
 const HOST = process.env.HOST || "0.0.0.0";
