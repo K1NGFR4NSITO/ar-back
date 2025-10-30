@@ -7,7 +7,6 @@ import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
 import { pool } from "./db.js";
-import { nanoid } from "nanoid";
 
 const app = express();
 app.use(cors({ origin: "*" }));          // en prod: restringe a tu dominio/front
