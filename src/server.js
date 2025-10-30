@@ -7,6 +7,7 @@ import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
 import { pool } from "./db.js";
+import { nanoid } from "nanoid";
 
 const app = express();
 app.use(cors({ origin: "*" }));          // en prod: restringe a tu dominio/front
@@ -45,6 +46,111 @@ app.get("/scores/top", async (req, res) => {
   );
   res.json(rows);
 });
+
+const ChallengeSchema = z.object({
+  name: z.string().min(1).max(80),
+  points_per_combo: z.number().int().min(0),
+  required_count: z.number().int().min(1).max(50),
+  duration_minutes: z.number().int().min(1).max(24 * 60),
+  fusion_ids: z.array(z.string().min(1)).min(1).max(500),
+});
+
+// Seguridad mínima para publicar desde tu panel web
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
+
+// Crea desafío (usa tu panel Netlify)
+app.post("/challenges", async (req, res) => {
+  try {
+    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    const body = ChallengeSchema.parse(req.body);
+
+    const { rows } = await pool.query(
+      `INSERT INTO challenges (name, points_per_combo, required_count, expires_at)
+       VALUES ($1,$2,$3, NOW() + ($4 || ' minutes')::interval)
+       RETURNING id, name, points_per_combo, required_count, expires_at, created_at`,
+      [body.name, body.points_per_combo, body.required_count, body.duration_minutes]
+    );
+    const challengeId = rows[0].id;
+
+    const values = body.fusion_ids.map((fid) => `(${challengeId}, '${fid}')`).join(",");
+    await pool.query(
+      `INSERT INTO challenge_fusions (challenge_id, fusion_id) VALUES ${values}`
+    );
+
+    // notifica a web y Unity
+    await broadcastChallengeUpdate(challengeId);
+
+    res.json({ ok: true, challenge: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+// Obtiene el desafío activo (el que expira primero y sigue vigente)
+app.get("/challenges/active", async (_req, res) => {
+  const c = await pool.query(
+    `SELECT id, name, points_per_combo, required_count, expires_at
+       FROM challenges
+      WHERE expires_at > NOW()
+      ORDER BY expires_at ASC
+      LIMIT 1`
+  );
+  if (c.rowCount === 0) return res.json(null);
+
+  const f = await pool.query(
+    `SELECT fusion_id FROM challenge_fusions WHERE challenge_id = $1`,
+    [c.rows[0].id]
+  );
+  res.json({ ...c.rows[0], fusion_ids: f.rows.map((r) => r.fusion_id) });
+});
+
+// Borrar desafío (por id)
+app.delete("/challenges/:id", async (req, res) => {
+  try {
+    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    await pool.query("DELETE FROM challenges WHERE id = $1", [req.params.id]);
+    await broadcastChallengeUpdate(null);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+// Utilidad de broadcast (web y Unity)
+async function broadcastChallengeUpdate(idOrNull) {
+  // Web (Socket.IO)
+  const payload = await getActiveChallengePayload();
+  io.emit("challenge_updated", payload);
+
+  // WS puro (Unity)
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      try { client.send(JSON.stringify({ type: "challenge_updated", data: payload })); } catch {}
+    }
+  }
+}
+
+async function getActiveChallengePayload() {
+  const c = await pool.query(
+    `SELECT id, name, points_per_combo, required_count, expires_at
+       FROM challenges
+      WHERE expires_at > NOW()
+      ORDER BY expires_at ASC
+      LIMIT 1`
+  );
+  if (c.rowCount === 0) return null;
+  const f = await pool.query(
+    `SELECT fusion_id FROM challenge_fusions WHERE challenge_id = $1`,
+    [c.rows[0].id]
+  );
+  return { ...c.rows[0], fusion_ids: f.rows.map((r) => r.fusion_id) };
+}
 
 // --- HTTP base ---
 const HOST = process.env.HOST || "0.0.0.0";
