@@ -121,6 +121,87 @@ app.delete("/challenges/:id", async (req, res) => {
   }
 });
 
+// --- Listado/Historial de desafíos ---
+
+// GET /challenges/history?n=10  (alias simple)
+app.get("/challenges/history", async (req, res) => {
+  try {
+    const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
+    const { rows } = await pool.query(
+      `SELECT
+         c.id, c.name, c.points_per_combo, c.required_count,
+         c.expires_at, c.created_at,
+         COALESCE(
+           json_agg(cf.fusion_id ORDER BY cf.fusion_id)
+             FILTER (WHERE cf.fusion_id IS NOT NULL),
+           '[]'
+         ) AS fusion_ids
+       FROM challenges c
+       LEFT JOIN challenge_fusions cf ON cf.challenge_id = c.id
+       GROUP BY c.id
+       ORDER BY c.created_at DESC
+       LIMIT $1`,
+      [n]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+// GET /challenges?limit=20&offset=0  (paginado más flexible)
+app.get("/challenges", async (req, res) => {
+  try {
+    const limit  = Math.min(Math.max(parseInt(req.query.limit ?? "20", 10) || 20, 1), 200);
+    const offset = Math.max(parseInt(req.query.offset ?? "0", 10) || 0, 0);
+    const { rows } = await pool.query(
+      `SELECT
+         c.id, c.name, c.points_per_combo, c.required_count,
+         c.expires_at, c.created_at,
+         COALESCE(
+           json_agg(cf.fusion_id ORDER BY cf.fusion_id)
+             FILTER (WHERE cf.fusion_id IS NOT NULL),
+           '[]'
+         ) AS fusion_ids
+       FROM challenges c
+       LEFT JOIN challenge_fusions cf ON cf.challenge_id = c.id
+       GROUP BY c.id
+       ORDER BY c.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+// GET /challenges/:id  (detalle por id)
+app.get("/challenges/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const c = await pool.query(
+      `SELECT id, name, points_per_combo, required_count, expires_at, created_at
+         FROM challenges
+        WHERE id = $1`,
+      [id]
+    );
+    if (c.rowCount === 0) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const f = await pool.query(
+      `SELECT fusion_id FROM challenge_fusions WHERE challenge_id = $1 ORDER BY fusion_id`,
+      [id]
+    );
+    res.json({ ...c.rows[0], fusion_ids: f.rows.map(r => r.fusion_id) });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+
 // Utilidad de broadcast (web y Unity)
 async function broadcastChallengeUpdate(idOrNull) {
   // Web (Socket.IO)
