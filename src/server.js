@@ -5,14 +5,15 @@ import "dotenv/config";
 import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
+import { URL } from "url";
 import { z } from "zod";
 import { pool } from "./db.js";
 
 const app = express();
 app.use(cors({
-  origin: "*",
-  allowedHeaders: ["Content-Type", "Authorization"], // <- para Bearer
-  methods: ["GET","POST","DELETE","OPTIONS"]
+  origin: "*",                                 // prod: restringe a tu dominio
+  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET","POST","DELETE","OPTIONS"],
 }));
 app.use(express.json());
 
@@ -50,18 +51,27 @@ app.get("/scores/top", async (req, res) => {
 });
 
 // === CHALLENGES ===
-const ChallengeSchema = z.object({
+const ChallengeBase = z.object({
   name: z.string().min(1).max(80),
   points_per_combo: z.number().int().min(0),
   required_count: z.number().int().min(1).max(50),
-  duration_minutes: z.number().int().min(1).max(24 * 60),
   fusion_ids: z.array(z.string().min(1)).min(1).max(500),
 });
+const ChallengeSchema = ChallengeBase.and(
+  z.union([
+    z.object({ duration_minutes: z.number().int().min(1).max(24 * 60) }),
+    z.object({
+      expires_at: z
+        .string()
+        .refine((v) => !Number.isNaN(Date.parse(v)), "expires_at debe ser ISO válido"),
+    }),
+  ])
+);
 
 // Seguridad mínima con token
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
 
-// Crear desafío
+// Crear desafío (acepta duration_minutes o expires_at)
 app.post("/challenges", async (req, res) => {
   try {
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
@@ -70,11 +80,22 @@ app.post("/challenges", async (req, res) => {
 
     const body = ChallengeSchema.parse(req.body);
 
+    // Construimos INSERT con la cláusula de expiración según lo enviado
+    let expiresClause;
+    let params;
+    if ("duration_minutes" in body) {
+      expiresClause = "NOW() + ($4 || ' minutes')::interval";
+      params = [body.name, body.points_per_combo, body.required_count, body.duration_minutes];
+    } else {
+      expiresClause = "$4::timestamptz";
+      params = [body.name, body.points_per_combo, body.required_count, body.expires_at];
+    }
+
     const { rows } = await pool.query(
       `INSERT INTO challenges (name, points_per_combo, required_count, expires_at)
-       VALUES ($1,$2,$3, NOW() + ($4 || ' minutes')::interval)
+       VALUES ($1,$2,$3, ${expiresClause})
        RETURNING id, name, points_per_combo, required_count, expires_at, created_at`,
-      [body.name, body.points_per_combo, body.required_count, body.duration_minutes]
+      params
     );
 
     const challengeId = rows[0].id;
@@ -135,7 +156,7 @@ app.get("/challenges/history", async (req, res) => {
 // Listado paginado
 app.get("/challenges", async (req, res) => {
   try {
-    const limit  = Math.min(Math.max(parseInt(req.query.limit ?? "20", 10) || 20, 1), 200);
+    const limit = Math.min(Math.max(parseInt(req.query.limit ?? "20", 10) || 20, 1), 200);
     const offset = Math.max(parseInt(req.query.offset ?? "0", 10) || 0, 0);
     const { rows } = await pool.query(
       `SELECT
@@ -180,14 +201,14 @@ app.get("/challenges/:id", async (req, res) => {
       `SELECT fusion_id FROM challenge_fusions WHERE challenge_id = $1 ORDER BY fusion_id`,
       [id]
     );
-    res.json({ ...c.rows[0], fusion_ids: f.rows.map(r => r.fusion_id) });
+    res.json({ ...c.rows[0], fusion_ids: f.rows.map((r) => r.fusion_id) });
   } catch (e) {
     console.error("GET /challenges/:id", e);
     res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
-// (NUEVO) Expirar otros desafíos
+// Expirar otros desafíos
 app.post("/challenges/expire_others", async (req, res) => {
   try {
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
@@ -296,10 +317,22 @@ io.on("connection", (socket) => {
   });
 });
 
-// --- WebSocket puro (Unity) ---
-const wss = new WebSocketServer({
-  server,
-  perMessageDeflate: false,
+// --- WebSocket puro (Unity) SOLO en /unity ---
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const { pathname } = new URL(req.url, "http://localhost");
+    if (pathname !== "/unity") {
+      socket.destroy(); // rechazamos upgrades que no sean /unity
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } catch {
+    try { socket.destroy(); } catch {}
+  }
 });
 
 function startHeartbeat(ws) {
@@ -315,7 +348,7 @@ const pingInterval = setInterval(() => {
 }, 30000);
 
 wss.on("connection", (ws, req) => {
-  console.log("✅ WS puro conectado:", req.socket.remoteAddress);
+  console.log("✅ WS puro conectado:", req.socket.remoteAddress, req.url);
   startHeartbeat(ws);
 
   ws.on("message", async (raw) => {
