@@ -10,22 +10,22 @@ import { pool } from "./db.js";
 
 const app = express();
 
-// --- CORS + Body parsers ---
+/* ================== CORS + body parsers ================== */
 app.use(cors({
-  origin: "*", // prod: restringe a tu dominio
+  origin: "*", // en prod: restringe a tu dominio
   allowedHeaders: ["Content-Type", "Authorization"],
   methods: ["GET","POST","DELETE","OPTIONS"],
 }));
 app.use(express.json());
-// importante: aceptar forms móviles (x-www-form-urlencoded)
+// aceptar formularios (x-www-form-urlencoded) desde móviles
 app.use(express.urlencoded({ extended: false }));
 
-// --- Health (Render) ---
+/* ================== Health (Render) ================== */
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-/* ========= Detección de columnas opcionales =========
-   Si la tabla scores tiene challenge_id (int) y/o class (text),
-   las usaremos; de lo contrario, ignoramos esos campos sin romper.
+/* ========= Detección de columnas opcionales en scores =========
+   Si tu tabla `scores` tiene challenge_id (int) y/o class (text),
+   las usamos; si no, las ignoramos sin romper nada.
 */
 let HAS_CHALLENGE_ID = false;
 let HAS_CLASS = false;
@@ -43,22 +43,20 @@ async function detectOptionalColumns() {
     HAS_CLASS = cols.has("class");
     console.log("scores columns:", { HAS_CHALLENGE_ID, HAS_CLASS });
   } catch (e) {
-    console.warn("No se pudo inspeccionar columnas opcionales de scores:", e?.message || e);
+    console.warn("No se pudo inspeccionar columnas de scores:", e?.message || e);
   }
 }
-
-// Llamamos pero sin bloquear el arranque
 detectOptionalColumns();
 
-/* ========= Schemas ========= */
-// Coerción robusta: acepta strings de formularios
+/* ================== Schemas ================== */
 const SubmitSchema = z.object({
   name: z.string().trim().min(1).max(60),
   score: z.preprocess(v => Number(v), z.number().int().nonnegative()),
-  // opcionales (se insertan solo si hay columnas)
   class: z.string().trim().min(1).max(60).optional(),
-  challenge_id: z.preprocess(v => v === undefined || v === null || v === ""
-    ? undefined : Number(v), z.number().int().positive().optional()),
+  challenge_id: z.preprocess(
+    v => (v === undefined || v === null || v === "" ? undefined : Number(v)),
+    z.number().int().positive().optional()
+  ),
 });
 
 const ChallengeBase = z.object({
@@ -71,38 +69,30 @@ const ChallengeSchema = ChallengeBase.and(
   z.union([
     z.object({ duration_minutes: z.number().int().min(1).max(24 * 60) }),
     z.object({
-      expires_at: z
-        .string()
+      expires_at: z.string()
         .refine((v) => !Number.isNaN(Date.parse(v)), "expires_at debe ser ISO válido"),
     }),
   ])
 );
 
-// Seguridad mínima admin
+// seguridad mínima admin
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
 
-/* ========= REST: puntajes ========= */
-
-// POST JSON o x-www-form-urlencoded
+/* ================== REST: puntajes ================== */
 app.post("/scores", async (req, res) => {
   try {
     const data = SubmitSchema.parse(req.body);
 
-    // Armamos el INSERT dinámico según columnas disponibles
     const cols = ["name", "score"];
     const params = [data.name, data.score];
     let placeholders = ["$1", "$2"];
     let idx = 3;
 
     if (HAS_CHALLENGE_ID && data.challenge_id !== undefined) {
-      cols.push("challenge_id");
-      params.push(data.challenge_id);
-      placeholders.push(`$${idx++}`);
+      cols.push("challenge_id"); params.push(data.challenge_id); placeholders.push(`$${idx++}`);
     }
     if (HAS_CLASS && data.class !== undefined) {
-      cols.push("class");
-      params.push(data.class);
-      placeholders.push(`$${idx++}`);
+      cols.push("class"); params.push(data.class); placeholders.push(`$${idx++}`);
     }
 
     const sql = `
@@ -120,7 +110,6 @@ app.post("/scores", async (req, res) => {
   }
 });
 
-// Ranking general (como antes)
 app.get("/scores/top", async (req, res) => {
   const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
   const { rows } = await pool.query(
@@ -133,9 +122,7 @@ app.get("/scores/top", async (req, res) => {
   res.json(rows);
 });
 
-/* ========= Resultados por desafío (para tu panel web) =========
-   Si no hay columna challenge_id, devolvemos [] para estos endpoints.
-*/
+// Resultados por desafío (para el panel web)
 app.get("/scores/by_challenge/:id", async (req, res) => {
   try {
     if (!HAS_CHALLENGE_ID) return res.json([]);
@@ -150,11 +137,8 @@ app.get("/scores/by_challenge/:id", async (req, res) => {
       [id]
     );
     res.json(rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      score: r.score,
-      class: HAS_CLASS ? r.class : undefined,
-      created_at: r.created_at,
+      id: r.id, name: r.name, score: r.score,
+      class: HAS_CLASS ? r.class : undefined, created_at: r.created_at,
     })));
   } catch (e) {
     console.error("GET /scores/by_challenge/:id", e);
@@ -176,11 +160,8 @@ app.get("/scores/by_challenge", async (req, res) => {
       [id]
     );
     res.json(rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      score: r.score,
-      class: HAS_CLASS ? r.class : undefined,
-      created_at: r.created_at,
+      id: r.id, name: r.name, score: r.score,
+      class: HAS_CLASS ? r.class : undefined, created_at: r.created_at,
     })));
   } catch (e) {
     console.error("GET /scores/by_challenge", e);
@@ -188,8 +169,7 @@ app.get("/scores/by_challenge", async (req, res) => {
   }
 });
 
-/* ========= CHALLENGES (igual que tenías) ========= */
-
+/* ================== CHALLENGES (como lo tenías) ================== */
 app.post("/challenges", async (req, res) => {
   try {
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
@@ -240,7 +220,6 @@ app.get("/challenges/active", async (_req, res) => {
   }
 });
 
-// historial
 app.get("/challenges/history", async (req, res) => {
   try {
     const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
@@ -320,16 +299,13 @@ app.get("/challenges/:id", async (req, res) => {
   }
 });
 
-// NUEVO: resultados preferidos como espera tu web
+// resultados “preferidos” que usa tu front
 app.get("/challenges/:id/results", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ ok:false, error:"invalid_id" });
+    if (!HAS_CHALLENGE_ID) return res.json([]);
 
-    if (!HAS_CHALLENGE_ID) {
-      // si no hay challenge_id, no podemos segmentar
-      return res.json([]);
-    }
     const { rows } = await pool.query(
       `SELECT id, name, score${HAS_CLASS ? ", class" : ""}, created_at
          FROM scores
@@ -337,13 +313,9 @@ app.get("/challenges/:id/results", async (req, res) => {
         ORDER BY score DESC, name ASC`,
       [id]
     );
-    // adapta el shape al esperado por el front (name, score, class)
     res.json(rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      score: r.score,
-      class: HAS_CLASS ? r.class : undefined,
-      created_at: r.created_at,
+      id: r.id, name: r.name, score: r.score,
+      class: HAS_CLASS ? r.class : undefined, created_at: r.created_at,
     })));
   } catch (e) {
     console.error("GET /challenges/:id/results", e);
@@ -351,7 +323,6 @@ app.get("/challenges/:id/results", async (req, res) => {
   }
 });
 
-// expirar otros
 app.post("/challenges/expire_others", async (req, res) => {
   try {
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
@@ -395,11 +366,11 @@ app.delete("/challenges/:id", async (req, res) => {
   }
 });
 
-/* ========= Helpers broadcast ========= */
+/* ================== helpers broadcast ================== */
 async function broadcastChallengeUpdate() {
   const payload = await getActiveChallengePayload();
-  io.emit("challenge_updated", payload);
-  for (const client of wss.clients) {
+  io.emit("challenge_updated", payload);           // web (Socket.IO)
+  for (const client of wss.clients) {              // unity (WS)
     if (client.readyState === 1) {
       try { client.send(JSON.stringify({ type: "challenge_updated", data: payload })); } catch {}
     }
@@ -423,9 +394,11 @@ async function getActiveChallengePayload() {
   return { ...c.rows[0], fusion_ids: f.rows.map((r) => r.fusion_id) };
 }
 
-/* ========= HTTP + Sockets ========= */
+/* ================== HTTP + sockets ================== */
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
+
+// *** CREAR EL SERVER UNA SOLA VEZ ***
 const server = http.createServer(app);
 
 // Socket.IO (web)
@@ -439,7 +412,6 @@ io.on("connection", (socket) => {
     socket.emit("top", top);
   });
 
-  // submit_score vía Socket.IO (ej. app web/Unity con socket)
   socket.on("submit_score", async (payload, cb) => {
     try {
       const data = SubmitSchema.parse(payload);
@@ -450,14 +422,10 @@ io.on("connection", (socket) => {
       let idx = 3;
 
       if (HAS_CHALLENGE_ID && data.challenge_id !== undefined) {
-        cols.push("challenge_id");
-        params.push(data.challenge_id);
-        placeholders.push(`$${idx++}`);
+        cols.push("challenge_id"); params.push(data.challenge_id); placeholders.push(`$${idx++}`);
       }
       if (HAS_CLASS && data.class !== undefined) {
-        cols.push("class");
-        params.push(data.class);
-        placeholders.push(`$${idx++}`);
+        cols.push("class"); params.push(data.class); placeholders.push(`$${idx++}`);
       }
 
       const sql = `
@@ -480,11 +448,8 @@ io.on("connection", (socket) => {
   });
 });
 
-// WebSocket puro (Unity) en el mismo puerto (sin path especial)
-const wss = new WebSocketServer({
-  server,
-  perMessageDeflate: false,
-});
+// WebSocket puro (Unity) en el mismo puerto
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 function startHeartbeat(ws) {
   ws.isAlive = true;
@@ -506,7 +471,9 @@ wss.on("connection", (ws, req) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg?.type === "score") {
-        const data = SubmitSchema.parse({ name: msg.name, score: msg.score, class: msg.class, challenge_id: msg.challenge_id });
+        const data = SubmitSchema.parse({
+          name: msg.name, score: msg.score, class: msg.class, challenge_id: msg.challenge_id
+        });
 
         const cols = ["name", "score"];
         const params = [data.name, data.score];
@@ -514,14 +481,10 @@ wss.on("connection", (ws, req) => {
         let idx = 3;
 
         if (HAS_CHALLENGE_ID && data.challenge_id !== undefined) {
-          cols.push("challenge_id");
-          params.push(data.challenge_id);
-          placeholders.push(`$${idx++}`);
+          cols.push("challenge_id"); params.push(data.challenge_id); placeholders.push(`$${idx++}`);
         }
         if (HAS_CLASS && data.class !== undefined) {
-          cols.push("class");
-          params.push(data.class);
-          placeholders.push(`$${idx++}`);
+          cols.push("class"); params.push(data.class); placeholders.push(`$${idx++}`);
         }
 
         const sql = `
@@ -551,7 +514,7 @@ wss.on("connection", (ws, req) => {
   try { ws.send(JSON.stringify({ type: "hello", msg: "conectado" })); } catch {}
 });
 
-/* ========= Utils ========= */
+/* ================== Utils ================== */
 async function getTop(n = 10) {
   n = Math.min(Math.max(parseInt(n, 10) || 10, 1), 200);
   const { rows } = await pool.query(
@@ -566,16 +529,15 @@ async function getTop(n = 10) {
 
 async function broadcastTop() {
   const top = await getTop(10);
-  io.emit("top_updated", top);
-  for (const client of wss.clients) {
+  io.emit("top_updated", top); // web (Socket.IO)
+  for (const client of wss.clients) { // unity (WS)
     if (client.readyState === 1) {
       try { client.send(JSON.stringify({ type: "top_updated", data: top })); } catch {}
     }
   }
 }
 
-/* ========= Arranque ========= */
-const server = http.createServer(app);
+/* ================== Arranque ================== */
 server.listen(PORT, HOST, () => {
   console.log(`Servidor escuchando en http://${HOST}:${PORT}`);
 });
