@@ -9,7 +9,11 @@ import { z } from "zod";
 import { pool } from "./db.js";
 
 const app = express();
-app.use(cors({ origin: "*" }));          // en prod: restringe a tu dominio/front
+app.use(cors({
+  origin: "*",
+  allowedHeaders: ["Content-Type", "Authorization"], // <- para Bearer
+  methods: ["GET","POST","DELETE","OPTIONS"]
+}));
 app.use(express.json());
 
 // --- Health check (Render) ---
@@ -37,7 +41,6 @@ app.post("/scores", async (req, res) => {
 });
 
 app.get("/scores/top", async (req, res) => {
-  // cap de seguridad
   const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
   const { rows } = await pool.query(
     "select id, name, score, created_at from scores order by score desc, id asc limit $1",
@@ -55,13 +58,12 @@ const ChallengeSchema = z.object({
   fusion_ids: z.array(z.string().min(1)).min(1).max(500),
 });
 
-// Seguridad mínima (podrás activarla cuando quieras)
+// Seguridad mínima con token
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
 
-// Crea desafío
+// Crear desafío
 app.post("/challenges", async (req, res) => {
   try {
-    // Si aun no quieres seguridad, deja esta línea comentada:
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
@@ -77,16 +79,14 @@ app.post("/challenges", async (req, res) => {
 
     const challengeId = rows[0].id;
 
-    // Inserta fusion_ids
-    const values = body.fusion_ids.map((fid, i) => `($1, $${i + 2})`).join(",");
+    // Inserta combinaciones
+    const values = body.fusion_ids.map((_, i) => `($1, $${i + 2})`).join(",");
     await pool.query(
       `INSERT INTO challenge_fusions (challenge_id, fusion_id) VALUES ${values}`,
       [challengeId, ...body.fusion_ids]
     );
 
-    // Notifica
     await broadcastChallengeUpdate(challengeId);
-
     res.json({ ok: true, challenge: rows[0] });
   } catch (e) {
     console.error("POST /challenges", e);
@@ -105,7 +105,7 @@ app.get("/challenges/active", async (_req, res) => {
   }
 });
 
-// Historial simple (poner ANTES de /:id)
+// Historial simple
 app.get("/challenges/history", async (req, res) => {
   try {
     const n = Math.min(Math.max(parseInt(req.query.n ?? "10", 10) || 10, 1), 200);
@@ -132,7 +132,7 @@ app.get("/challenges/history", async (req, res) => {
   }
 });
 
-// Listado paginado (poner ANTES de /:id)
+// Listado paginado
 app.get("/challenges", async (req, res) => {
   try {
     const limit  = Math.min(Math.max(parseInt(req.query.limit ?? "20", 10) || 20, 1), 200);
@@ -160,7 +160,7 @@ app.get("/challenges", async (req, res) => {
   }
 });
 
-// Detalle por id (poner DESPUÉS de las rutas anteriores)
+// Detalle por id
 app.get("/challenges/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -187,6 +187,32 @@ app.get("/challenges/:id", async (req, res) => {
   }
 });
 
+// (NUEVO) Expirar otros desafíos
+app.post("/challenges/expire_others", async (req, res) => {
+  try {
+    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    const keepId = Number(req.body?.keep_id) || null;
+
+    if (keepId) {
+      await pool.query(
+        "UPDATE challenges SET expires_at = NOW() - interval '1 second' WHERE id <> $1 AND expires_at > NOW()",
+        [keepId]
+      );
+    } else {
+      await pool.query(
+        "UPDATE challenges SET expires_at = NOW() - interval '1 second' WHERE expires_at > NOW()"
+      );
+    }
+    await broadcastChallengeUpdate();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /challenges/expire_others", e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
 // Borrar desafío
 app.delete("/challenges/:id", async (req, res) => {
   try {
@@ -209,9 +235,7 @@ app.delete("/challenges/:id", async (req, res) => {
 // --- helpers de broadcast ---
 async function broadcastChallengeUpdate() {
   const payload = await getActiveChallengePayload();
-  // web (Socket.IO)
   io.emit("challenge_updated", payload);
-  // unity (WS)
   for (const client of wss.clients) {
     if (client.readyState === 1) {
       try { client.send(JSON.stringify({ type: "challenge_updated", data: payload })); } catch {}
@@ -236,14 +260,13 @@ async function getActiveChallengePayload() {
   return { ...c.rows[0], fusion_ids: f.rows.map((r) => r.fusion_id) };
 }
 
-
 // --- HTTP base ---
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 const server = http.createServer(app);
 
 // --- Socket.IO (para web) ---
-const io = new SocketIOServer(server, { cors: { origin: "*" } }); // prod: restringe
+const io = new SocketIOServer(server, { cors: { origin: "*" } });
 
 io.on("connection", (socket) => {
   console.log("✅ socket conectado:", socket.id);
@@ -274,14 +297,11 @@ io.on("connection", (socket) => {
 });
 
 // --- WebSocket puro (Unity) ---
-// Comparte puerto con HTTP/Socket.IO • sin path especial (Unity puede conectarse a wss://…)
 const wss = new WebSocketServer({
   server,
-  // algunos proxies se llevan mal con perMessageDeflate
   perMessageDeflate: false,
 });
 
-// Heartbeat para que Render/proxy no corte la conexión inactiva
 function startHeartbeat(ws) {
   ws.isAlive = true;
   ws.on("pong", () => { ws.isAlive = true; });
@@ -327,7 +347,7 @@ wss.on("connection", (ws, req) => {
   try { ws.send(JSON.stringify({ type: "hello", msg: "conectado" })); } catch {}
 });
 
-// --- Utils compartidas ---
+// Utils
 async function getTop(n = 10) {
   n = Math.min(Math.max(parseInt(n, 10) || 10, 1), 200);
   const { rows } = await pool.query(
@@ -339,9 +359,7 @@ async function getTop(n = 10) {
 
 async function broadcastTop() {
   const top = await getTop(10);
-  // Web (Socket.IO)
   io.emit("top_updated", top);
-  // WS puro (Unity)
   for (const client of wss.clients) {
     if (client.readyState === 1) {
       try { client.send(JSON.stringify({ type: "top_updated", data: top })); } catch {}
@@ -349,7 +367,7 @@ async function broadcastTop() {
   }
 }
 
-// --- Arranque / cierre ---
+// Arranque / cierre
 server.listen(PORT, HOST, () => {
   console.log(`Servidor escuchando en http://${HOST}:${PORT}`);
 });
