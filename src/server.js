@@ -7,6 +7,7 @@ import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
 import { pool } from "./db.js";
+import jwt from "jsonwebtoken"; // 👈 NUEVO: JWT
 
 const app = express();
 
@@ -75,7 +76,90 @@ const ChallengeSchema = ChallengeBase.and(
   ])
 );
 
-// seguridad mínima admin
+/* ================== Auth (JWT sencillo) ================== */
+// ⚠️ Importante: ya creaste la tabla `users` con password_hash.
+// Por ahora comparamos en texto plano (sin bcrypt), tal como lo tienes en DB.
+// Más adelante, si quieres, cambiamos a hash real sin romper nada.
+const JWT_SECRET = process.env.JWT_SECRET || "super-secret-chemar";
+
+/**
+ * POST /auth/login
+ * Body: { username, password }
+ * Respuesta:
+ *   { ok:true, token, user:{ id,name,username,role } }
+ */
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+
+    if (!username || !password) {
+      return res.status(400).json({ ok: false, error: "Faltan credenciales" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, name, username, password_hash, role, active
+       FROM users
+       WHERE username = $1
+       LIMIT 1`,
+      [username]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({ ok: false, error: "Usuario no encontrado" });
+    }
+
+    const user = rows[0];
+
+    if (!user.active) {
+      return res.status(403).json({ ok: false, error: "Usuario inactivo" });
+    }
+
+    // 🔑 Comparación sencilla: password == password_hash (sin hash por ahora)
+    if (String(user.password_hash) !== String(password)) {
+      return res.status(401).json({ ok: false, error: "Contraseña incorrecta" });
+    }
+
+    const payload = {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "12h" });
+
+    return res.json({
+      ok: true,
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        username: user.username,
+        role: user.role,
+      },
+    });
+  } catch (e) {
+    console.error("POST /auth/login error:", e);
+    return res.status(500).json({ ok: false, error: "Error en login" });
+  }
+});
+
+// (Opcional) Endpoint para que el front verifique un token y saque los datos del usuario
+app.get("/auth/me", (req, res) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.replace("Bearer ", "").trim();
+    if (!token) return res.status(401).json({ ok: false, error: "Sin token" });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return res.json({ ok: true, user: decoded });
+  } catch (e) {
+    return res.status(401).json({ ok: false, error: "Token inválido" });
+  }
+});
+
+/* ================== seguridad mínima admin ================== */
+// Esto sigue igual que antes, para el panel de desafíos:
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
 
 /* ================== REST: puntajes ================== */
