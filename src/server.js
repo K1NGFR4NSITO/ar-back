@@ -15,7 +15,7 @@ const app = express();
 app.use(cors({
   origin: "*", // en prod: restringe a tu dominio
   allowedHeaders: ["Content-Type", "Authorization"],
-  methods: ["GET","POST","DELETE","OPTIONS"],
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
 }));
 app.use(express.json());
 // aceptar formularios (x-www-form-urlencoded) desde móviles
@@ -211,7 +211,7 @@ app.get("/scores/by_challenge/:id", async (req, res) => {
   try {
     if (!HAS_CHALLENGE_ID) return res.json([]);
     const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ ok:false, error:"invalid_id" });
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
 
     const { rows } = await pool.query(
       `SELECT id, name, score${HAS_CLASS ? ", class" : ""}, created_at
@@ -226,7 +226,7 @@ app.get("/scores/by_challenge/:id", async (req, res) => {
     })));
   } catch (e) {
     console.error("GET /scores/by_challenge/:id", e);
-    res.status(400).json({ ok:false, error:String(e) });
+    res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
@@ -234,7 +234,7 @@ app.get("/scores/by_challenge", async (req, res) => {
   try {
     if (!HAS_CHALLENGE_ID) return res.json([]);
     const id = Number(req.query.challenge_id);
-    if (!Number.isInteger(id)) return res.status(400).json({ ok:false, error:"invalid_id" });
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
 
     const { rows } = await pool.query(
       `SELECT id, name, score${HAS_CLASS ? ", class" : ""}, created_at
@@ -249,7 +249,7 @@ app.get("/scores/by_challenge", async (req, res) => {
     })));
   } catch (e) {
     console.error("GET /scores/by_challenge", e);
-    res.status(400).json({ ok:false, error:String(e) });
+    res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
@@ -387,7 +387,7 @@ app.get("/challenges/:id", async (req, res) => {
 app.get("/challenges/:id/results", async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ ok:false, error:"invalid_id" });
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
     if (!HAS_CHALLENGE_ID) return res.json([]);
 
     const { rows } = await pool.query(
@@ -403,7 +403,7 @@ app.get("/challenges/:id/results", async (req, res) => {
     })));
   } catch (e) {
     console.error("GET /challenges/:id/results", e);
-    res.status(400).json({ ok:false, error:String(e) });
+    res.status(400).json({ ok: false, error: String(e) });
   }
 });
 
