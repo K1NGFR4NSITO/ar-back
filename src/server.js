@@ -7,8 +7,6 @@ import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
 import { pool } from "./db.js";
-import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
 
 const app = express();
 
@@ -16,55 +14,19 @@ const app = express();
 app.use(cors({
   origin: "*", // en prod: restringe a tu dominio
   allowedHeaders: ["Content-Type", "Authorization"],
-  methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
+  methods: ["GET","POST","DELETE","OPTIONS"],
 }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: false })); // formularios
+// aceptar formularios (x-www-form-urlencoded) desde móviles
+app.use(express.urlencoded({ extended: false }));
 
 /* ================== Health (Render) ================== */
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-/* ================== Auth helpers ================== */
-const JWT_SECRET = process.env.JWT_SECRET || "supersecret-local";
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme"; // ya lo usabas para challenges
-
-function signToken(user) {
-  // user: { id, username, name, role }
-  return jwt.sign(
-    {
-      id: user.id,
-      username: user.username,
-      name: user.name,
-      role: user.role,
-    },
-    JWT_SECRET,
-    { expiresIn: "7d" }
-  );
-}
-
-function authRequired(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const [scheme, token] = auth.split(" ");
-  if (scheme !== "Bearer" || !token) {
-    return res.status(401).json({ ok: false, error: "missing_token" });
-  }
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    next();
-  } catch (e) {
-    return res.status(401).json({ ok: false, error: "invalid_token" });
-  }
-}
-
-function requireAdmin(req, res, next) {
-  if (!req.user || req.user.role !== "admin") {
-    return res.status(403).json({ ok: false, error: "forbidden" });
-  }
-  next();
-}
-
-/* ========= Detección de columnas opcionales en scores ========= */
+/* ========= Detección de columnas opcionales en scores =========
+   Si tu tabla `scores` tiene challenge_id (int) y/o class (text),
+   las usamos; si no, las ignoramos sin romper nada.
+*/
 let HAS_CHALLENGE_ID = false;
 let HAS_CLASS = false;
 
@@ -86,7 +48,7 @@ async function detectOptionalColumns() {
 }
 detectOptionalColumns();
 
-/* ================== Schemas generales ================== */
+/* ================== Schemas ================== */
 const SubmitSchema = z.object({
   name: z.string().trim().min(1).max(60),
   score: z.preprocess(v => Number(v), z.number().int().nonnegative()),
@@ -113,297 +75,8 @@ const ChallengeSchema = ChallengeBase.and(
   ])
 );
 
-/* ================== Schemas de usuarios (login/registro) ================== */
-
-const RegisterDocenteSchema = z.object({
-  name: z.string().min(1).max(80),
-  username: z.string().min(3).max(40),
-  password: z.string().min(6).max(100),
-});
-
-const LoginSchema = z.object({
-  username: z.string().min(1),
-  password: z.string().min(1),
-});
-
-const AdminCreateUserSchema = RegisterDocenteSchema.extend({
-  role: z.enum(["docente", "admin"]).default("docente"),
-  active: z.boolean().optional(), // por defecto true para admin
-});
-
-const AdminUpdateUserSchema = z.object({
-  name: z.string().min(1).max(80).optional(),
-  username: z.string().min(3).max(40).optional(),
-  password: z.string().min(6).max(100).optional(),
-  role: z.enum(["docente", "admin"]).optional(),
-  active: z.boolean().optional(),
-});
-
-/* ================== REST: AUTH & USERS ================== */
-
-/**
- * Registro público de DOCENTES.
- * - Crea usuario con role = 'docente' y active = false
- * - El administrador luego podrá activarlos desde /admin/users
- */
-app.post("/auth/register-docente", async (req, res) => {
-  try {
-    const data = RegisterDocenteSchema.parse(req.body);
-
-    // ¿Usuario ya existe?
-    const exists = await pool.query(
-      "SELECT 1 FROM users WHERE username = $1 LIMIT 1",
-      [data.username]
-    );
-    if (exists.rowCount > 0) {
-      return res.status(409).json({ ok: false, error: "username_taken" });
-    }
-
-    const hash = await bcrypt.hash(data.password, 10);
-
-    const { rows } = await pool.query(
-      `INSERT INTO users (name, username, password, role, active)
-       VALUES ($1,$2,$3,'docente', false)
-       RETURNING id, name, username, role, active, created_at`,
-      [data.name, data.username, hash]
-    );
-
-    return res.status(201).json({
-      ok: true,
-      user: rows[0],
-      message: "Cuenta creada. Un administrador debe activarla.",
-    });
-  } catch (e) {
-    console.error("POST /auth/register-docente", e);
-    return res.status(400).json({ ok: false, error: String(e) });
-  }
-});
-
-/**
- * Login genérico (docente / admin).
- * - Rechaza docentes inactivos.
- * - Devuelve JWT + datos básicos.
- */
-app.post("/auth/login", async (req, res) => {
-  try {
-    const data = LoginSchema.parse(req.body);
-
-    const result = await pool.query(
-      `SELECT id, name, username, password, role, active, created_at
-         FROM users
-        WHERE username = $1
-        LIMIT 1`,
-      [data.username]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(400).json({ ok: false, error: "invalid_credentials" });
-    }
-
-    const user = result.rows[0];
-
-    // Primero intentar comparar como hash bcrypt
-    let passwordOk = false;
-    try {
-      passwordOk = await bcrypt.compare(data.password, user.password);
-    } catch {
-      passwordOk = false;
-    }
-
-    // Fallback: por si tu admin viejo está en texto plano
-    if (!passwordOk && data.password === user.password) {
-      passwordOk = true;
-    }
-
-    if (!passwordOk) {
-      return res.status(400).json({ ok: false, error: "invalid_credentials" });
-    }
-
-    if (user.role === "docente" && !user.active) {
-      return res.status(403).json({
-        ok: false,
-        error: "inactive_account",
-        message: "Un administrador debe activar tu cuenta.",
-      });
-    }
-
-    const publicUser = {
-      id: user.id,
-      name: user.name,
-      username: user.username,
-      role: user.role,
-      active: user.active,
-      created_at: user.created_at,
-    };
-
-    const token = signToken(publicUser);
-
-    return res.json({ ok: true, token, user: publicUser });
-  } catch (e) {
-    console.error("POST /auth/login", e);
-    return res.status(400).json({ ok: false, error: String(e) });
-  }
-});
-
-/**
- * Info del perfil logueado (para el front).
- */
-app.get("/auth/me", authRequired, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, name, username, role, active, created_at
-         FROM users WHERE id = $1`,
-      [req.user.id]
-    );
-    if (result.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "not_found" });
-    }
-    return res.json({ ok: true, user: result.rows[0] });
-  } catch (e) {
-    console.error("GET /auth/me", e);
-    return res.status(400).json({ ok: false, error: String(e) });
-  }
-});
-
-/* ================== ADMIN: gestión de usuarios ================== */
-
-/**
- * Listar todos los usuarios (panel admin)
- */
-app.get("/admin/users", authRequired, requireAdmin, async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, name, username, role, active, created_at
-         FROM users
-         ORDER BY id ASC`
-    );
-    return res.json({ ok: true, users: rows });
-  } catch (e) {
-    console.error("GET /admin/users", e);
-    return res.status(400).json({ ok: false, error: String(e) });
-  }
-});
-
-/**
- * Crear usuario manualmente desde el panel admin
- * (por ejemplo otro admin o un docente ya activo).
- */
-app.post("/admin/users", authRequired, requireAdmin, async (req, res) => {
-  try {
-    const data = AdminCreateUserSchema.parse(req.body);
-
-    const exists = await pool.query(
-      "SELECT 1 FROM users WHERE username = $1 LIMIT 1",
-      [data.username]
-    );
-    if (exists.rowCount > 0) {
-      return res.status(409).json({ ok: false, error: "username_taken" });
-    }
-
-    const hash = await bcrypt.hash(data.password, 10);
-    const active = data.active ?? true;
-
-    const { rows } = await pool.query(
-      `INSERT INTO users (name, username, password, role, active)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING id, name, username, role, active, created_at`,
-      [data.name, data.username, hash, data.role, active]
-    );
-
-    return res.status(201).json({ ok: true, user: rows[0] });
-  } catch (e) {
-    console.error("POST /admin/users", e);
-    return res.status(400).json({ ok: false, error: String(e) });
-  }
-});
-
-/**
- * Editar usuario (activar/desactivar, cambiar nombre, etc.)
- */
-app.patch("/admin/users/:id", authRequired, requireAdmin, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
-      return res.status(400).json({ ok: false, error: "invalid_id" });
-    }
-
-    const data = AdminUpdateUserSchema.parse(req.body);
-    const fields = [];
-    const params = [];
-    let idx = 1;
-
-    if (data.name !== undefined) {
-      fields.push(`name = $${idx++}`);
-      params.push(data.name);
-    }
-    if (data.username !== undefined) {
-      fields.push(`username = $${idx++}`);
-      params.push(data.username);
-    }
-    if (data.role !== undefined) {
-      fields.push(`role = $${idx++}`);
-      params.push(data.role);
-    }
-    if (data.active !== undefined) {
-      fields.push(`active = $${idx++}`);
-      params.push(data.active);
-    }
-    if (data.password !== undefined) {
-      const hash = await bcrypt.hash(data.password, 10);
-      fields.push(`password = $${idx++}`);
-      params.push(hash);
-    }
-
-    if (fields.length === 0) {
-      return res.status(400).json({ ok: false, error: "nothing_to_update" });
-    }
-
-    params.push(id);
-    const sql = `
-      UPDATE users
-         SET ${fields.join(", ")}
-       WHERE id = $${idx}
-       RETURNING id, name, username, role, active, created_at
-    `;
-
-    const { rows } = await pool.query(sql, params);
-    if (rows.length === 0) {
-      return res.status(404).json({ ok: false, error: "not_found" });
-    }
-
-    return res.json({ ok: true, user: rows[0] });
-  } catch (e) {
-    console.error("PATCH /admin/users/:id", e);
-    return res.status(400).json({ ok: false, error: String(e) });
-  }
-});
-
-/**
- * Eliminar usuario (admin).
- * Puedes evitar que borren al admin principal si quieres.
- */
-app.delete("/admin/users/:id", authRequired, requireAdmin, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
-      return res.status(400).json({ ok: false, error: "invalid_id" });
-    }
-
-    const { rowCount } = await pool.query(
-      "DELETE FROM users WHERE id = $1",
-      [id]
-    );
-
-    if (rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "not_found" });
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /admin/users/:id", e);
-    return res.status(400).json({ ok: false, error: String(e) });
-  }
-});
+// seguridad mínima admin
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
 
 /* ================== REST: puntajes ================== */
 app.post("/scores", async (req, res) => {
@@ -496,7 +169,7 @@ app.get("/scores/by_challenge", async (req, res) => {
   }
 });
 
-/* ================== CHALLENGES ================== */
+/* ================== CHALLENGES (como lo tenías) ================== */
 app.post("/challenges", async (req, res) => {
   try {
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
@@ -777,8 +450,6 @@ io.on("connection", (socket) => {
 
 // WebSocket puro (Unity) en el mismo puerto
 const wss = new WebSocketServer({ server, perMessageDeflate: false });
-wss.on("headers", () => {});
-
 
 function startHeartbeat(ws) {
   ws.isAlive = true;
