@@ -1,3 +1,4 @@
+
 {
   "name": "ar-backend",
   "version": "1.0.0",
@@ -12,8 +13,6 @@
     "ws": "^8.17.1",
     "socket.io": "^4.7.5",
     "zod": "^3.23.8",
-    "dotenv": "^16.4.5",
-    "jsonwebtoken": "^9.0.2",
-    "bcryptjs": "^2.4.3"
+    "dotenv": "^16.4.5"
   }
 }
