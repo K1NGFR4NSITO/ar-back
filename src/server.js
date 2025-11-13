@@ -777,6 +777,8 @@ io.on("connection", (socket) => {
 
 // WebSocket puro (Unity) en el mismo puerto
 const wss = new WebSocketServer({ server, perMessageDeflate: false });
+wss.on("headers", () => {});
+
 
 function startHeartbeat(ws) {
   ws.isAlive = true;
