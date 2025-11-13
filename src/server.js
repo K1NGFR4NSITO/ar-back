@@ -14,19 +14,15 @@ const app = express();
 app.use(cors({
   origin: "*", // en prod: restringe a tu dominio
   allowedHeaders: ["Content-Type", "Authorization"],
-  methods: ["GET","POST","DELETE","OPTIONS"],
+  methods: ["GET","POST","DELETE","PATCH","OPTIONS"],
 }));
 app.use(express.json());
-// aceptar formularios (x-www-form-urlencoded) desde móviles
 app.use(express.urlencoded({ extended: false }));
 
 /* ================== Health (Render) ================== */
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-/* ========= Detección de columnas opcionales en scores =========
-   Si tu tabla `scores` tiene challenge_id (int) y/o class (text),
-   las usamos; si no, las ignoramos sin romper nada.
-*/
+/* ========= Detección de columnas opcionales en scores ========= */
 let HAS_CHALLENGE_ID = false;
 let HAS_CLASS = false;
 
@@ -75,8 +71,190 @@ const ChallengeSchema = ChallengeBase.and(
   ])
 );
 
-// seguridad mínima admin
+/* ========= Schemas para usuarios / login ========= */
+const LoginSchema = z.object({
+  username: z.string().min(1, "Usuario requerido"),
+  password: z.string().min(1, "Contraseña requerida"),
+});
+
+const RegisterUserSchema = z.object({
+  name: z.string().min(1).max(80),
+  username: z.string().min(3).max(50),
+  password: z.string().min(4).max(100),
+  role: z.enum(["admin", "docente"]).default("docente"),
+  active: z.boolean().optional(),
+});
+
+const UpdateUserSchema = z.object({
+  active: z.boolean().optional(),
+  role: z.enum(["admin", "docente"]).optional(),
+  toggleActive: z.boolean().optional(),
+}).refine(v =>
+  v.active !== undefined || v.role !== undefined || v.toggleActive,
+  { message: "Sin cambios" }
+);
+
+/* ================== seguridad mínima admin ================== */
+// Esto ya lo tenías: lo usamos para /challenges y para /users.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme";
+
+/* ================== AUTH SENCILLO (sin JWT) ================== */
+
+/**
+ * POST /auth/login
+ * Body: { username, password }
+ * Respuesta:
+ *   { ok:true, user:{ id,name,username,role,active }, is_admin:boolean }
+ */
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { username, password } = LoginSchema.parse(req.body ?? {});
+    const { rows } = await pool.query(
+      `SELECT id, name, username, password, role, active
+         FROM users
+        WHERE username = $1
+        LIMIT 1`,
+      [username]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({ ok: false, error: "Credenciales inválidas" });
+    }
+
+    const user = rows[0];
+
+    if (!user.active) {
+      return res.status(403).json({ ok: false, error: "Usuario inactivo" });
+    }
+
+    // Comparación de texto plano (tal como está en tu tabla).
+    if (String(user.password) !== String(password)) {
+      return res.status(401).json({ ok: false, error: "Credenciales inválidas" });
+    }
+
+    return res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        name: user.name,
+        username: user.username,
+        role: user.role,
+        active: user.active,
+      },
+      is_admin: user.role === "admin",
+    });
+  } catch (e) {
+    console.error("POST /auth/login error:", e);
+    return res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+/**
+ * POST /auth/register
+ * Crea un usuario nuevo (pensado para que lo llame el admin desde el panel).
+ * Body: { name, username, password, role?, active? }
+ * Requiere header: Authorization: Bearer ADMIN_TOKEN
+ */
+app.post("/auth/register", async (req, res) => {
+  try {
+    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const data = RegisterUserSchema.parse(req.body ?? {});
+    const { rows } = await pool.query(
+      `INSERT INTO users (name, username, password, role, active)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id, name, username, role, active, created_at`,
+      [data.name, data.username, data.password, data.role, data.active ?? true]
+    );
+
+    res.json({ ok: true, user: rows[0] });
+  } catch (e) {
+    console.error("POST /auth/register error:", e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+/**
+ * GET /users
+ * Lista todos los usuarios (para el panel de admin).
+ * Requiere Authorization: Bearer ADMIN_TOKEN
+ */
+app.get("/users", async (req, res) => {
+  try {
+    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, name, username, role, active, created_at
+         FROM users
+        ORDER BY id ASC`
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("GET /users error:", e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
+
+/**
+ * PATCH /users/:id
+ * Permite cambiar rol o (des)activar un usuario.
+ * Body: { active?, role?, toggleActive? }
+ * Requiere Authorization: Bearer ADMIN_TOKEN
+ */
+app.patch("/users/:id", async (req, res) => {
+  try {
+    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_id" });
+    }
+
+    const data = UpdateUserSchema.parse(req.body ?? {});
+    const sets = [];
+    const params = [];
+    let idx = 1;
+
+    if (data.toggleActive) {
+      sets.push("active = NOT active");
+    }
+    if (data.active !== undefined) {
+      sets.push(`active = $${idx++}`);
+      params.push(data.active);
+    }
+    if (data.role) {
+      sets.push(`role = $${idx++}`);
+      params.push(data.role);
+    }
+
+    if (!sets.length) {
+      return res.status(400).json({ ok: false, error: "no_fields" });
+    }
+
+    params.push(id);
+    const { rows } = await pool.query(
+      `UPDATE users
+          SET ${sets.join(", ")}
+        WHERE id = $${idx}
+        RETURNING id, name, username, role, active, created_at`,
+      params
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "not_found" });
+    }
+
+    res.json({ ok: true, user: rows[0] });
+  } catch (e) {
+    console.error("PATCH /users/:id error:", e);
+    res.status(400).json({ ok: false, error: String(e) });
+  }
+});
 
 /* ================== REST: puntajes ================== */
 app.post("/scores", async (req, res) => {
@@ -169,7 +347,7 @@ app.get("/scores/by_challenge", async (req, res) => {
   }
 });
 
-/* ================== CHALLENGES (como lo tenías) ================== */
+/* ================== CHALLENGES (igual que tenías) ================== */
 app.post("/challenges", async (req, res) => {
   try {
     if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
@@ -299,7 +477,6 @@ app.get("/challenges/:id", async (req, res) => {
   }
 });
 
-// resultados “preferidos” que usa tu front
 app.get("/challenges/:id/results", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -369,8 +546,8 @@ app.delete("/challenges/:id", async (req, res) => {
 /* ================== helpers broadcast ================== */
 async function broadcastChallengeUpdate() {
   const payload = await getActiveChallengePayload();
-  io.emit("challenge_updated", payload);           // web (Socket.IO)
-  for (const client of wss.clients) {              // unity (WS)
+  io.emit("challenge_updated", payload);
+  for (const client of wss.clients) {
     if (client.readyState === 1) {
       try { client.send(JSON.stringify({ type: "challenge_updated", data: payload })); } catch {}
     }
@@ -398,7 +575,6 @@ async function getActiveChallengePayload() {
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 
-// *** CREAR EL SERVER UNA SOLA VEZ ***
 const server = http.createServer(app);
 
 // Socket.IO (web)
@@ -529,8 +705,8 @@ async function getTop(n = 10) {
 
 async function broadcastTop() {
   const top = await getTop(10);
-  io.emit("top_updated", top); // web (Socket.IO)
-  for (const client of wss.clients) { // unity (WS)
+  io.emit("top_updated", top);
+  for (const client of wss.clients) {
     if (client.readyState === 1) {
       try { client.send(JSON.stringify({ type: "top_updated", data: top })); } catch {}
     }
