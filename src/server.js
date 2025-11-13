@@ -89,19 +89,10 @@ const UpdateUserSchema = z.object({
   active: z.boolean().optional(),
   role: z.enum(["admin", "docente"]).optional(),
   toggleActive: z.boolean().optional(),
-  name: z.string().min(1).max(80).optional(),
-  username: z.string().min(3).max(50).optional(),
-  password: z.string().min(4).max(100).optional(),
 }).refine(v =>
-  v.active !== undefined ||
-  v.role !== undefined ||
-  v.toggleActive ||
-  v.name !== undefined ||
-  v.username !== undefined ||
-  v.password !== undefined,
+  v.active !== undefined || v.role !== undefined || v.toggleActive,
   { message: "Sin cambios" }
 );
-
 
 /* ================== seguridad mínima admin ================== */
 // Esto ya lo tenías: lo usamos para /challenges y para /users.
@@ -240,26 +231,13 @@ app.patch("/users/:id", async (req, res) => {
       sets.push(`role = $${idx++}`);
       params.push(data.role);
     }
-    if (data.name) {
-      sets.push(`name = $${idx++}`);
-      params.push(data.name);
-    }
-    if (data.username) {
-      sets.push(`username = $${idx++}`);
-      params.push(data.username);
-    }
-    if (data.password) {
-      // OJO: está en texto plano igual que en /auth/register
-      sets.push(`password = $${idx++}`);
-      params.push(data.password);
-    }
 
     if (!sets.length) {
       return res.status(400).json({ ok: false, error: "no_fields" });
     }
 
     params.push(id);
-    const result = await pool.query(
+    const { rows } = await pool.query(
       `UPDATE users
           SET ${sets.join(", ")}
         WHERE id = $${idx}
@@ -267,50 +245,16 @@ app.patch("/users/:id", async (req, res) => {
       params
     );
 
-    if (!result.rows.length) {
+    if (!rows.length) {
       return res.status(404).json({ ok: false, error: "not_found" });
     }
 
-    res.json({ ok: true, user: result.rows[0] });
+    res.json({ ok: true, user: rows[0] });
   } catch (e) {
     console.error("PATCH /users/:id error:", e);
-    // típico error de unique constraint de username
-    if (e.code === "23505") {
-      return res.status(400).json({ ok: false, error: "username_duplicado" });
-    }
     res.status(400).json({ ok: false, error: String(e) });
   }
 });
-app.delete("/users/:id", async (req, res) => {
-  try {
-    if ((req.headers.authorization || "") !== `Bearer ${ADMIN_TOKEN}`) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
-      return res.status(400).json({ ok: false, error: "invalid_id" });
-    }
-
-    // Opcional: evitar que se borre a sí mismo el admin base
-    // if (id === 1) { ... }
-
-    const result = await pool.query(
-      "DELETE FROM users WHERE id = $1",
-      [id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "not_found" });
-    }
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /users/:id error:", e);
-    res.status(400).json({ ok: false, error: String(e) });
-  }
-});
-
 
 /* ================== REST: puntajes ================== */
 app.post("/scores", async (req, res) => {
